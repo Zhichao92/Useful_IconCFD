@@ -1,0 +1,690 @@
+#!/apps/ford/aero/fordcfd/default/python/bin/python3
+import argparse
+import os
+import sys
+import re
+import subprocess
+import glob
+sys.path.append("/apps/ford/aero/fordcfd/default")
+import fordcfd.icon
+
+# Parser options
+parser = argparse.ArgumentParser(description="Resubmission script for iconCFD simulations")
+parser.add_argument("--add-iterations",nargs="?",const=1000,type=int,
+                    help="Number of iterations to add to the simulation (default value of 1000)")
+parser.add_argument("--add-time",nargs="?",const=0,type=float,
+                    help="Amount of time to add to the simulation (default value of 0s)")
+parser.add_argument("--retry",nargs="+",choices=["smaller-dt","more-nonOrthogonal-correctors","lower-URFs","same-settings","seed-case"],
+                    help="Retry a simulation that has crashed")
+parser.add_argument("--seed-case-location",type=str,help="Location of case folder for seeding a transient job")
+
+required = parser.add_argument_group('required arguments')
+required.add_argument("-P","--vehicle-program",help="Vehicle program to submit against",required=True)
+
+args = parser.parse_args()
+
+
+def checkInputArguments():
+    """Make sure the input options are appropriate"""
+    if args.add_iterations is None and args.add_time is None and args.retry is None:
+        if args.seed_case_location is None:
+            print("No arguments specified. Nothing will be done.")
+            sys.exit()
+        else:
+            if not os.path.isdir(args.seed_case_location):
+                print("Error: specified seed-case-location (" + args.seed_case_location + ") does not exist.")
+                sys.exit()
+    if args.add_iterations is not None:
+        if args.add_time is not None:
+           print("Error: Cannot specify both 'add-iterations' and 'add-time'.")
+           if isSteady:
+               print("       For steady simulation, use 'add-iterations'.")
+           else:
+               print("       For transient simulations, use 'add-time'.")
+           sys.exit()
+        if not isSteady:
+            print("Error: cannot add iterations to a transient run.")
+            print("       Use the 'add-time' flag instead.")
+            sys.exit()
+        if args.add_iterations <= 0:
+            print("Error: Invalid value",args.add_iterations,"for 'add-iterations'.")
+            sys.exit()
+        if args.retry is not None:
+            if "same-settings" in args.retry:
+                print("Error: Does not make sense to retry with the same settings and to add more iterations.")
+                print("       Choose one or the other.")
+                sys.exit()
+        else:
+            if args.seed_case_location is not None:
+                print("Error: Does not make sense to add iterations to a run and to seed from another run.")
+                print("       Choose one or the other.")
+                sys.exit()
+        print("Re-running for an additional",args.add_iterations,"iterations.")
+    if args.add_time is not None:
+        if args.add_iterations is not None:
+           print("Error: Cannot specify both 'add-iterations' and 'add-time'.")
+           if isSteady:
+               print("       For steady simulation, use 'add-iterations'.")
+           else:
+               print("       For transient simulations, use 'add-time'.")
+           sys.exit()
+        if isSteady:
+            print("Error: Cannot add time to a steady-state run.")
+            print("       Use the 'add-iterations' flag instead.")
+            sys.exit()
+        if args.add_time < 0.0:
+            print("Error: Invalid value",args.add_time,"for 'add-time'.")
+            sys.exit()
+        if args.retry is not None:
+            if "same-settings" in args.retry:
+                print("Error: Does not make sense to retry with the same settings and to add more time.")
+                print("       Choose one or the other.")
+                sys.exit()
+        else:
+            if args.seed_case_location is not None:
+                print("Error: Does not make sense to add time to a run and to seed from another run.")
+                print("       Choose one or the other.")
+                sys.exit()
+
+        print("Re-running for an additional time of",args.add_time,"seconds.")
+
+    if args.retry is not None:
+        if "same-settings" in args.retry:
+            if ("smaller-dt" in args.retry) or ("more-nonOrthogonal-correctors" in args.retry) or ("lower-URFs" in args.retry):
+                print("Error: Cannot use 'same-settings' option in conjuction with one or more options specifying different settings.")
+                print("       Either use the 'same-settings' flag by itself, or omit the 'same-settings' flag and use one or more of the other retry flags instead.")
+                sys.exit()
+        if "smaller-dt" in args.retry:
+            if isSteady:
+                print("Error: Cannot reduce the time step for a steady simulation.")
+                print("       Try 'lower-URFs' instead.")
+                sys.exit()
+            else:
+                print("Re-running with a smaller time step.")
+        if "more-nonOrthogonal-correctors" in args.retry:
+            if isSteady:
+                print("Error: Cannot add non-orthogonal correctors to a steady simulation.")
+                print("       Try 'lower-URFs' instead.")
+                sys.exit()
+            else:
+                print("Re-running with more non-orthogonal correctors.")
+        if "lower-URFs" in args.retry:
+            if not isSteady:
+                print("Error: Cannot reduce under relaxation factors for an unsteady simulation.")
+                print("       Try 'smaller-dt' and/or 'more-nonOrthogonal-correctors' instead.")
+                sys.exit()
+            else:
+                print("Re-running with smaller under relaxation factors.")
+        if "seed-case" in args.retry:
+            if args.seed_case_location is None:
+                print("Error: Must specify location of the new seed case through the --seed-case-location flag.")
+                sys.exit()
+            else:
+                # Check if the specified location exists
+                if not os.path.isdir(args.seed_case_location):
+                    print("Error: specified seed-case-location (" + args.seed_case_location + ") does not exist.")
+                    sys.exit()
+
+
+def getIconcfdVersion():
+    """Determine the version of iconCFD the job was originally run with"""
+    blockMeshLogPath = os.path.join(os.getcwd(),"log","000_blockMesh_*.log")
+    blockMeshLogPath = glob.glob(blockMeshLogPath)[0]
+
+    with open(blockMeshLogPath) as f:
+        foundVersion = False
+        for line in f.readlines():
+            if re.match("^\|(\s+)Version:(.*)\|$", line):
+                foundVersion = True
+                line = line.replace("|", "")
+                line = (line.strip()).split() 
+                version = line[1]
+                print("The simulation was originally run with version " + version + ".")
+                # if version != "3.4.13":
+                #     print("Error: This resubmission utility is only designed for version 3.4.13 of iconCFD.")
+                if version == "3.2.31":
+                    print("      Use the 3.2.31 resubmission utility (\"/e/fnatase/TASE_Tools/IconCFD/scripts/resubmit-3.2\") for version 3.2.31.")
+                    sys.exit()
+                break
+        if foundVersion:
+            return version
+        else:
+            print("Error: No version information available.")
+            sys.exit()
+
+
+def reduceURFs():
+    """Reduce the under-relaxation factors for a run"""
+    fvSolutionPath = os.path.join(os.getcwd(),"system","fvSolution")
+
+    with open(fvSolutionPath) as f:
+        fvSolutionNew = ""
+        inSimpleC = False
+        for line in f.readlines():
+            # We've reached the end of the relaxF sub-dict
+            if inSimpleC and re.match("^}$",line):
+                inSimpleC = False
+                
+            if inSimpleC:
+                line_args = (line.strip()).split()
+                if len(line_args) > 1:
+                    oldURF = float(line_args[1][:-1])
+                    newURF = round(max(oldURF-0.1,0.5*oldURF),2)
+                    newURF_string = str(newURF) + ";"
+                    line = line.replace(line_args[1],newURF_string)
+                    print(line_args[0])
+                    print("  Old URF: " + str(oldURF))
+                    print("  New URF: " + str(newURF))
+
+            # Check for the start of the relaxF sub-dict
+            if re.match("^relaxationFactors_SIMPLEC$",line):
+                inSimpleC = True
+            # Build new text array for writing to new dataDict
+            fvSolutionNew += line
+
+    # Now, write to the new fvSolution file
+    with open(fvSolutionPath,"w") as f:
+        f.write(fvSolutionNew)
+
+
+def startFromTimeZero(controlDictPath):
+    """Make sure we start from the field at time 0, not the field that was written when the simulation blew up"""
+    with open(controlDictPath) as f:
+        controlDictNew = ""
+        for line in f.readlines():
+            if re.match("^startFrom latestTime;(.*)",line):
+                line = line.replace("latestTime","startTime")
+            controlDictNew += line
+    with open(controlDictPath,"w") as f:
+        f.write(controlDictNew)
+
+    
+def addIterations(iterations,increaseAveragingStartTime=False,retry=False):
+    """Add the specified number of iterations to the solver"""
+    controlDictPath = os.path.join(os.getcwd(),"system","controlDict")
+    with open(controlDictPath) as f:
+        controlDictNew = ""
+        for line in f.readlines():
+            if not retry:
+                if re.match("^startFrom startTime;(.*)",line):
+                    line = line.replace("startTime","latestTime")
+            if re.match("^endTime(.*);(.*)",line):
+                line_args = (line.strip()).split()
+                oldEndTime = int(line_args[1][:-1])
+                newEndTime = oldEndTime + iterations
+                newEndTime_string = str(newEndTime) + ";"
+                line = line.replace(line_args[1],newEndTime_string)
+                print(line_args[0])
+                print("  Old value: " + str(oldEndTime))
+                print("  New value: " + str(newEndTime))
+            if not retry:
+                if re.match("^writeInterval(.*);(.*)",line):
+                    line_args = (line.strip()).split()
+                    oldWriteInterval = line_args[1][:-1]
+                    newWriteInterval = iterations
+                    newWriteInterval_string = str(newWriteInterval) + ";"
+                    line = line.replace(line_args[1],newWriteInterval_string)
+                    print(line_args[0])
+                    print("  Old value: " + str(oldWriteInterval))
+                    print("  New value: " + str(newWriteInterval))
+            if re.match("^writeTime(.*);(.*)",line):
+                line_args = (line.strip()).split()
+                oldWriteTime = float(line_args[1][:-1])
+                newWriteTime = round(oldWriteTime + iterations,8)
+                newWriteTime_string = str(newWriteTime) + ";"
+                line = line.replace(line_args[1],newWriteTime_string)
+                print(line_args[0])
+                print("  Old value: " + str(oldWriteTime))
+                print("  New value: " + str(newWriteTime))
+            if increaseAveragingStartTime and re.match("^startTMeanVars(.*);(.*)",line):
+                line_args = (line.strip()).split()
+                oldAveragingStartTime = int(line_args[1][:-1])
+                newAveragingStartTime = oldAveragingStartTime + iterations
+                newAveragingStartTime_string = str(newAveragingStartTime) + ";"
+                line = line.replace(line_args[1],newAveragingStartTime_string)
+            controlDictNew += line
+    with open(controlDictPath,"w") as f:
+        f.write(controlDictNew)
+
+        
+def addTime(time,controlDictPath,retry=False):
+    """Add the specified amount of time to the fine solver"""
+    with open(controlDictPath) as f:
+        controlDictNew = ""
+        for line in f.readlines():
+            if not retry:
+                if re.match("^startFrom startTime;(.*)",line):
+                    line = line.replace("startTime","latestTime")
+            if re.match("^endTime(.*);(.*)",line):
+                line_args = (line.strip()).split()
+                oldEndTime = float(line_args[1][:-1])
+                newEndTime = round(oldEndTime + time,8)
+                newEndTime_string = str(newEndTime) + ";"
+                line = line.replace(line_args[1],newEndTime_string)
+                print(line_args[0])
+                print("  Old value: " + str(oldEndTime))
+                print("  New value: " + str(newEndTime))
+            if not retry:
+                if re.match("^writeInterval(.*);(.*)",line):
+                    line_args = (line.strip()).split()
+                    oldWriteInterval = line_args[1][:-1]
+                    if (time>0):
+                        newWriteInterval = time
+                    else:
+                        newWriteInterval = oldWriteInterval
+                    newWriteInterval_string = str(newWriteInterval) + ";"
+                    line = line.replace(line_args[1],newWriteInterval_string)
+                    print(line_args[0])
+                    print("  Old value: " + str(oldWriteInterval))
+                    print("  New value: " + str(newWriteInterval))
+            if re.match("^writeTime(.*);(.*)",line):
+                line_args = (line.strip()).split()
+                oldWriteTime = float(line_args[1][:-1])
+                newWriteTime = round(oldWriteTime + time,8)
+                newWriteTime_string = str(newWriteTime) + ";"
+                line = line.replace(line_args[1],newWriteTime_string)
+                print(line_args[0])
+                print("  Old value: " + str(oldWriteTime))
+                print("  New value: " + str(newWriteTime))
+            controlDictNew += line
+    with open(controlDictPath,"w") as f:
+        f.write(controlDictNew)
+
+        
+def modifyCommandsInfoSteady():
+    """Modify commands.info to restart a steady run"""
+    subprocess.call("cp commands.info commands.info.old", shell=True)
+    commandsInfoPath = os.path.join(os.getcwd(),"commands.info")
+    with open(commandsInfoPath) as f:
+        writeToFile = False
+        commandsInfoNew = ""
+        for line in f.readlines():
+            if "iconSimplecFoam" in line:
+                writeToFile = True
+            if writeToFile:
+                commandsInfoNew += line
+    with open(commandsInfoPath,"w") as f:
+        f.write(commandsInfoNew)
+
+
+def modifyCommandsInfoTransient():
+    """Modify commands.info to just re-run the transient solver"""
+    subprocess.call("cp commands.info commands.info.old", shell=True)
+    commandsInfoPath = os.path.join(os.getcwd(),"commands.info")
+    with open(commandsInfoPath) as f:
+        writeToFile = False
+        commandsInfoNew = ""
+        for line in f.readlines():
+            if "iconPisoFoam" in line:
+                writeToFile = True
+            if writeToFile:
+                commandsInfoNew += line
+    with open(commandsInfoPath,"w") as f:
+        f.write(commandsInfoNew)
+
+
+def setNonConformalMapping():
+    """Modify mapFieldsDict to allow non-conformal mapping"""
+    mapFieldsDictPath = os.path.join(os.getcwd(),"system","mapFieldsDict")
+    with open(mapFieldsDictPath) as f:
+        mapFieldsDictNew = ""
+        for line in f.readlines():
+            if re.match("^consistent(.*);(.*)",line):
+                line = line.replace("true","false")
+            mapFieldsDictNew += line
+    with open(mapFieldsDictPath,"w") as f:
+        f.write(mapFieldsDictNew)
+
+
+def modifyCommandsInfoMappedCaseTransient(location):
+    """Copy over the commands.info template file to modify it appropriately
+       for a transient simulation
+    """
+    subprocess.call("cp commands.info commands.info.old", shell=True)
+
+    # Set mapFieldsDict to allow non-conformal mapping
+    setNonConformalMapping()   
+
+    commands_info_template = \
+"""
+$MPICommand -np $NCPUsSolver $MPIOptions parMapFields -parallel -source $MAP_FROM 2>&1 | tee ./log/049_parMapFields_$simID.log
+$MPICommand -np $NCPUsSolver $MPIOptions iconPisoFoam -parallel 2>&1 | tee ./log/050_iconPisoFoam_$simID.log; RUN=${PIPESTATUS[0]}; if [ ${RUN} -gt 0 ]; then echo "BAD ending command: $0"; exit -1; fi #job2SOLV1
+$MPICommand $MPISerial $MPIOptionsSerial bash -c 'LastTiMe=$(find ./processor* -maxdepth 1 -mindepth 1 -type d | awk -F/ '\''{print 1*$NF}'\'' | grep -v ''0.org'' | sort -g | tail -1); LastTiMe0=0; for PROC in ./processor*; do if [ -d ${PROC}/${LastTiMe0} ]; then for VAR in $(find ${PROC}/${LastTiMe0} -maxdepth 1 -type f); do VARNAME=$(echo $VAR | awk -F/ '\''{print $NF}'\''); if [ ! -f ${PROC}/${LastTiMe}/${VARNAME} ]; then CMD=$(echo ''if [ -f ${VAR} ]\; then cp ${VAR} ${PROC}/${LastTiMe}\; fi''); eval $CMD; fi; done; fi; done' #job2SOLV1
+$MPICommand -np $NCPUsSolver $MPIOptions sample -parallel -latestTime 2>&1 | tee ./log/060_sample_$simID.log; RUN=${PIPESTATUS[0]}; if [ ${RUN} -gt 0 ]; then echo "BAD ending command: $0"; exit -1; fi #job2SOLV1
+$MPICommand -np $NCPUsSolver $MPIOptions foamToEnsight -parallel -noZero 2>&1 | tee ./log/070_foamToEnsight_$simID.log; RUN=${PIPESTATUS[0]}; if [ ${RUN} -gt 0 ]; then echo "BAD ending command: $0"; exit -1; fi #job2SOLV1
+$MPICommand $MPISerial $MPIOptionsSerial bash -c 'python /apps/ford/aero/fordcfd/v2.4.2/scripts/icon_success_log.py' #job2SOLV1
+"""
+
+    commands_info_str  = "MAP_FROM=" + location + "\n"
+    commands_info_str += commands_info_template
+
+    with open("commands.info","w") as f:
+        f.write(commands_info_str)
+
+
+def modifyCommandsInfoMappedCaseSteady(location):
+    """Copy over the commands.info template file to modify it appropriately
+       for a transient simulation
+    """
+    subprocess.call("cp commands.info commands.info.old", shell=True)
+
+    # Set mapFieldsDict to allow non-conformal mapping
+    setNonConformalMapping()
+
+    commands_info_template = \
+"""
+$MPICommand -np $NCPUsSolver $MPIOptions parMapFields -parallel -source $MAP_FROM 2>&1 | tee ./log/049_parMapFields_$simID.log
+$MPICommand -np $NCPUsSolver $MPIOptions iconSimplecFoam -parallel 2>&1 | tee ./log/050_iconSimplecFoam_$simID.log; RUN=${PIPESTATUS[0]}; if [ ${RUN} -gt 0 ]; then echo "BAD ending command: $0"; exit -1; fi #job2SOLV1
+$MPICommand $MPISerial $MPIOptionsSerial bash -c 'LastTiMe=$(find ./processor* -maxdepth 1 -mindepth 1 -type d | awk -F/ '\''{print 1*$NF}'\'' | grep -v ''0.org'' | sort -g | tail -1); LastTiMe0=0; for PROC in ./processor*; do if [ -d ${PROC}/${LastTiMe0} ]; then for VAR in $(find ${PROC}/${LastTiMe0} -maxdepth 1 -type f); do VARNAME=$(echo $VAR | awk -F/ '\''{print $NF}'\''); if [ ! -f ${PROC}/${LastTiMe}/${VARNAME} ]; then CMD=$(echo ''if [ -f ${VAR} ]\; then cp ${VAR} ${PROC}/${LastTiMe}\; fi''); eval $CMD; fi; done; fi; done' #job2SOLV1
+$MPICommand -np $NCPUsSolver $MPIOptions sample -parallel -latestTime 2>&1 | tee ./log/060_sample_$simID.log; RUN=${PIPESTATUS[0]}; if [ ${RUN} -gt 0 ]; then echo "BAD ending command: $0"; exit -1; fi #job2SOLV1
+$MPICommand -np $NCPUsSolver $MPIOptions foamToEnsight -parallel -noZero 2>&1 | tee ./log/070_foamToEnsight_$simID.log; RUN=${PIPESTATUS[0]}; if [ ${RUN} -gt 0 ]; then echo "BAD ending command: $0"; exit -1; fi #job2SOLV1
+$MPICommand $MPISerial $MPIOptionsSerial bash -c 'python /apps/ford/aero/fordcfd/v2.4.2/scripts/icon_success_log.py' #job2SOLV1
+"""
+
+    commands_info_str  = "MAP_FROM=" + location + "\n"
+    commands_info_str += commands_info_template
+
+    with open("commands.info","w") as f:
+        f.write(commands_info_str)
+
+
+def modifyCommandsInfoMappedCaseFromScratchTransient(location):
+    """Copy over the commands.info template file to modify it appropriately
+       when running a case from scratch (not resubmitting it) for a
+       transient simulation
+    """
+    subprocess.call("cp commands.info commands.info.old", shell=True)
+
+    # Set mapFieldsDict to allow non-conformal mapping
+    setNonConformalMapping()
+
+    commands_info_template = \
+"""
+#startCase VARIABLES: MPICommand MPISerial MPIOptions MPIOptionsMesh NCPUsMesh NCPUsSolver #job1MESH1
+#userWF: ST auxDT: 5e-05 auxendTime: 1.5 auxBaseSize: 2.5 #job1MESH1
+if [[ -z ${nMeshingThreads} ]]; then nMeshingThreads=1; fi #job1MESH1
+if [[ -z ${NCPUsMesh} || -z ${NCPUsSolver} || -z ${MPISerial} || -z ${MPICommand} ]]; then echo "Missing MPI flags; please update definitions"; exit -1; fi #job1MESH1
+$MPICommand $MPISerial $MPIOptionsSerial bash -c 'mkdir -p ./log; touch ./case.icon' #job1MESH1
+$MPICommand $MPISerial $MPIOptionsSerial bash -c 'for DIC in system/decomposeParDict system/controlDict system/blockMeshDict system/fvSolution system/fvSchemes constant/turbulenceProperties system/fvOptions system/changeDictionaryDict; do if [ -f ./${DIC}Initial ]; then cp ./${DIC}Initial ./${DIC}; fi; done' #job1MESH1
+$MPICommand $MPISerial $MPIOptionsSerial blockMesh 2>&1 | tee ./log/000_blockMesh_$simID.log; RUN=${PIPESTATUS[0]}; if [ ${RUN} -gt 0 ]; then echo "BAD ending command: $0"; exit -1; fi #job1MESH1
+$MPICommand $MPISerial $MPIOptionsSerial decomposePar -force 2>&1 | tee ./log/010_decomposePar_$simID.log; RUN=${PIPESTATUS[0]}; if [ ${RUN} -gt 0 ]; then echo "BAD ending command: $0"; exit -1; fi #job1MESH1
+$MPICommand -np $NCPUsMesh $MPIOptionsMesh iconHexMesh -parallel -nthreads ${nMeshingThreads} 2>&1 | tee ./log/020_iconHexMesh_$simID.log; RUN=${PIPESTATUS[0]}; if [ ${RUN} -gt 0 ]; then echo "BAD ending command: $0"; exit -1; fi #job1MESH1
+$MPICommand -np $NCPUsMesh $MPIOptionsMesh checkMesh -parallel -latestTime -nthreads ${nMeshingThreads} -writeVTK 2>&1 | tee ./log/023_checkMesh_$simID.log; RUN=${PIPESTATUS[0]}; if [ ${RUN} -gt 0 ]; then echo "BAD ending command: $0"; exit -1; fi #job1MESH1
+$MPICommand -np $NCPUsMesh $MPIOptionsMesh foamToEnsight -parallel -latestTime -nthreads ${nMeshingThreads} 2>&1 | tee ./log/024_foamToEnsight_$simID.log; RUN=${PIPESTATUS[0]}; if [ ${RUN} -gt 0 ]; then echo "BAD ending command: $0"; exit -1; fi #job1MESH1
+$MPICommand -np $NCPUsMesh $MPIOptionsMesh renumberMesh -overwrite -parallel -latestTime -nthreads ${nMeshingThreads} 2>&1 | tee ./log/025_renumberMesh_$simID.log; RUN=${PIPESTATUS[0]}; if [ ${RUN} -gt 0 ]; then echo "BAD ending command: $0"; exit -1; fi #job1MESH1
+
+$MPICommand -np $NCPUsSolver $MPIOptions redistributeMeshPar -parallel -overwrite 2>&1 | tee ./log/026_redistributeMeshPar_$simID.log; RUN=${PIPESTATUS[0]}; if [ ${RUN} -gt 0 ]; then echo "BAD ending command: $0"; exit -1; fi #job2SOLV1
+$MPICommand -np $NCPUsSolver $MPIOptions checkMesh -parallel -latestTime -writeVTK 2>&1 | tee ./log/027_checkMesh_$simID.log; RUN=${PIPESTATUS[0]}; if [ ${RUN} -gt 0 ]; then echo "BAD ending command: $0"; exit -1; fi #job2SOLV1
+$MPICommand $MPISerial $MPIOptionsSerial bash -c 'for PROC in ./processor*; do CMD=$(echo ''if [ -d ${PROC}/0 ]\; then cp -r ./0.org/* ${PROC}/0\; mkdir -p ${PROC}/constant\; fi''); eval $CMD; done;' #job2SOLV1
+$MPICommand -np $NCPUsSolver $MPIOptions changeDictionary -parallel -literalRE 2>&1 | tee ./log/028_changeDictionary_literalRE_$simID.log; RUN=${PIPESTATUS[0]}; if [ ${RUN} -gt 0 ]; then echo "BAD ending command: $0"; exit -1; fi #job2SOLV1
+$MPICommand -np $NCPUsSolver $MPIOptions renumberMesh -overwrite -parallel -latestTime 2>&1 | tee ./log/032_renumberMesh_fields_$simID.log; RUN=${PIPESTATUS[0]}; if [ ${RUN} -gt 0 ]; then echo "BAD ending command: $0"; exit -1; fi #job2SOLV1
+$MPICommand -np $NCPUsSolver $MPIOptions iconCellLimiter -parallel 2>&1 | tee ./log/033_iconCellLimiter_$simID.log; RUN=${PIPESTATUS[0]}; if [ ${RUN} -gt 0 ]; then echo "BAD ending command: $0"; exit -1; fi #job2SOLV1
+#039_PotentialFoam_indicator #job2SOLV1
+$MPICommand -np $NCPUsSolver $MPIOptions iconPotentialFoam -parallel 2>&1 | tee ./log/040_iconPotentialFoam_$simID.log; RUN=${PIPESTATUS[0]}; if [ ${RUN} -gt 0 ]; then echo "BAD ending command: $0"; exit -1; fi #job2SOLV1
+$MPICommand $MPISerial $MPIOptionsSerial bash -c 'for PROC in ./processor*; do if [ -f $PROC/0/k_rans.gz ]; then cp $PROC/0/k_rans.gz $PROC/0/k.gz; fi; if [ -f $PROC/0/omega_rans.gz ]; then cp $PROC/0/omega_rans.gz $PROC/0/omega.gz; fi; done' #job2SOLV1
+$MPICommand $MPISerial $MPIOptionsSerial bash -c 'cp ./system/controlDictSteady ./system/controlDict; cp ./system/fvSolutionSteady ./system/fvSolution; cp ./system/fvSchemesSteady ./system/fvSchemes; cp ./constant/turbulencePropertiesSteady ./constant/turbulenceProperties' #job2SOLV1
+
+$MPICommand -np $NCPUsSolver $MPIOptions parMapFields -parallel -source $MAP_FROM 2>&1 | tee ./log/049_parMapFields_$simID.log; RUN=${PIPESTATUS[0]}; if [ ${RUN} -gt 0 ]; then echo "BAD ending command: $0"; exit -1; fi #job2SOLV1
+$MPICommand -np $NCPUsSolver $MPIOptions iconPisoFoam -parallel 2>&1 | tee ./log/050_iconPisoFoam_$simID.log; RUN=${PIPESTATUS[0]}; if [ ${RUN} -gt 0 ]; then echo "BAD ending command: $0"; exit -1; fi #job2SOLV1
+$MPICommand $MPISerial $MPIOptionsSerial bash -c 'LastTiMe=$(find ./processor* -maxdepth 1 -mindepth 1 -type d | awk -F/ '\''{print 1*$NF}'\'' | grep -v ''0.org'' | sort -g | tail -1); LastTiMe0=0; for PROC in ./processor*; do if [ -d ${PROC}/${LastTiMe0} ]; then for VAR in $(find ${PROC}/${LastTiMe0} -maxdepth 1 -type f); do VARNAME=$(echo $VAR | awk -F/ '\''{print $NF}'\''); if [ ! -f ${PROC}/${LastTiMe}/${VARNAME} ]; then CMD=$(echo ''if [ -f ${VAR} ]\; then cp ${VAR} ${PROC}/${LastTiMe}\; fi''); eval $CMD; fi; done; fi; done' #job2SOLV1
+$MPICommand -np $NCPUsSolver $MPIOptions sample -parallel -latestTime 2>&1 | tee ./log/060_sample_$simID.log; RUN=${PIPESTATUS[0]}; if [ ${RUN} -gt 0 ]; then echo "BAD ending command: $0"; exit -1; fi #job2SOLV1
+$MPICommand -np $NCPUsSolver $MPIOptions foamToEnsight -parallel -noZero 2>&1 | tee ./log/070_foamToEnsight_$simID.log; RUN=${PIPESTATUS[0]}; if [ ${RUN} -gt 0 ]; then echo "BAD ending command: $0"; exit -1; fi #job2SOLV1
+$MPICommand $MPISerial $MPIOptionsSerial bash -c 'python /apps/ford/aero/fordcfd/v2.4.2/scripts/icon_success_log.py' #job2SOLV1
+"""
+
+    commands_info_str  = "MAP_FROM=" + location + "\n"
+    commands_info_str += commands_info_template
+
+    with open("commands.info","w") as f:
+        f.write(commands_info_str)
+
+
+def modifyCommandsInfoMappedCaseFromScratchSteady(location):
+    """Copy over the commands.info template file to modify it appropriately
+       when running a case from scratch (not resubmitting it) for a
+       steady simulation
+    """
+    subprocess.call("cp commands.info commands.info.old", shell=True)
+
+    # Set mapFieldsDict to allow non-conformal mapping
+    setNonConformalMapping()
+
+    commands_info_template = \
+"""
+#startCase VARIABLES: MPICommand MPISerial MPIOptions MPIOptionsMesh NCPUsMesh NCPUsSolver #job1MESH1
+#userWF: ST auxDT: 1 auxendTime: 3000 auxBaseSize: 2.5 #job1MESH1
+if [[ -z ${nMeshingThreads} ]]; then nMeshingThreads=1; fi #job1MESH1
+if [[ -z ${NCPUsMesh} || -z ${NCPUsSolver} || -z ${MPISerial} || -z ${MPICommand} ]]; then echo "Missing MPI flags; please update definitions"; exit -1; fi #job1MESH1
+$MPICommand $MPISerial $MPIOptionsSerial bash -c 'mkdir -p ./log; touch ./case.icon' #job1MESH1
+$MPICommand $MPISerial $MPIOptionsSerial bash -c 'for DIC in system/decomposeParDict system/controlDict system/blockMeshDict system/fvSolution system/fvSchemes constant/turbulenceProperties system/fvOptions system/changeDictionaryDict; do if [ -f ./${DIC}Initial ]; then cp ./${DIC}Initial ./${DIC}; fi; done' #job1MESH1
+$MPICommand $MPISerial $MPIOptionsSerial blockMesh 2>&1 | tee ./log/000_blockMesh_$simID.log; RUN=${PIPESTATUS[0]}; if [ ${RUN} -gt 0 ]; then echo "BAD ending command: $0"; exit -1; fi #job1MESH1
+$MPICommand $MPISerial $MPIOptionsSerial decomposePar -force 2>&1 | tee ./log/010_decomposePar_$simID.log; RUN=${PIPESTATUS[0]}; if [ ${RUN} -gt 0 ]; then echo "BAD ending command: $0"; exit -1; fi #job1MESH1
+$MPICommand -np $NCPUsMesh $MPIOptionsMesh iconHexMesh -parallel -nthreads ${nMeshingThreads} 2>&1 | tee ./log/020_iconHexMesh_$simID.log; RUN=${PIPESTATUS[0]}; if [ ${RUN} -gt 0 ]; then echo "BAD ending command: $0"; exit -1; fi #job1MESH1
+$MPICommand -np $NCPUsMesh $MPIOptionsMesh checkMesh -parallel -latestTime -nthreads ${nMeshingThreads} -writeVTK 2>&1 | tee ./log/023_checkMesh_$simID.log; RUN=${PIPESTATUS[0]}; if [ ${RUN} -gt 0 ]; then echo "BAD ending command: $0"; exit -1; fi #job1MESH1
+$MPICommand -np $NCPUsMesh $MPIOptionsMesh foamToEnsight -parallel -latestTime -nthreads ${nMeshingThreads} 2>&1 | tee ./log/024_foamToEnsight_$simID.log; RUN=${PIPESTATUS[0]}; if [ ${RUN} -gt 0 ]; then echo "BAD ending command: $0"; exit -1; fi #job1MESH1
+$MPICommand -np $NCPUsMesh $MPIOptionsMesh renumberMesh -overwrite -parallel -latestTime -nthreads ${nMeshingThreads} 2>&1 | tee ./log/025_renumberMesh_$simID.log; RUN=${PIPESTATUS[0]}; if [ ${RUN} -gt 0 ]; then echo "BAD ending command: $0"; exit -1; fi #job1MESH1
+
+$MPICommand -np $NCPUsSolver $MPIOptions redistributeMeshPar -parallel -overwrite 2>&1 | tee ./log/026_redistributeMeshPar_$simID.log; RUN=${PIPESTATUS[0]}; if [ ${RUN} -gt 0 ]; then echo "BAD ending command: $0"; exit -1; fi #job2SOLV1
+$MPICommand -np $NCPUsSolver $MPIOptions checkMesh -parallel -latestTime -writeVTK 2>&1 | tee ./log/027_checkMesh_$simID.log; RUN=${PIPESTATUS[0]}; if [ ${RUN} -gt 0 ]; then echo "BAD ending command: $0"; exit -1; fi #job2SOLV1
+$MPICommand $MPISerial $MPIOptionsSerial bash -c 'for PROC in ./processor*; do CMD=$(echo ''if [ -d ${PROC}/0 ]\; then cp -r ./0.org/* ${PROC}/0\; mkdir -p ${PROC}/constant\; fi''); eval $CMD; done;' #job2SOLV1
+$MPICommand -np $NCPUsSolver $MPIOptions changeDictionary -parallel -literalRE 2>&1 | tee ./log/028_changeDictionary_literalRE_$simID.log; RUN=${PIPESTATUS[0]}; if [ ${RUN} -gt 0 ]; then echo "BAD ending command: $0"; exit -1; fi #job2SOLV1
+$MPICommand -np $NCPUsSolver $MPIOptions renumberMesh -overwrite -parallel -latestTime 2>&1 | tee ./log/032_renumberMesh_fields_$simID.log; RUN=${PIPESTATUS[0]}; if [ ${RUN} -gt 0 ]; then echo "BAD ending command: $0"; exit -1; fi #job2SOLV1
+$MPICommand -np $NCPUsSolver $MPIOptions iconCellLimiter -parallel 2>&1 | tee ./log/033_iconCellLimiter_$simID.log; RUN=${PIPESTATUS[0]}; if [ ${RUN} -gt 0 ]; then echo "BAD ending command: $0"; exit -1; fi #job2SOLV1
+#039_PotentialFoam_indicator #job2SOLV1
+$MPICommand -np $NCPUsSolver $MPIOptions iconPotentialFoam -parallel 2>&1 | tee ./log/040_iconPotentialFoam_$simID.log; RUN=${PIPESTATUS[0]}; if [ ${RUN} -gt 0 ]; then echo "BAD ending command: $0"; exit -1; fi #job2SOLV1
+$MPICommand -np $NCPUsSolver $MPIOptions parMapFields -parallel -source $MAP_FROM 2>&1 | tee ./log/049_parMapFields_$simID.log
+$MPICommand -np $NCPUsSolver $MPIOptions iconSimplecFoam -parallel 2>&1 | tee ./log/050_iconSimplecFoam_$simID.log; RUN=${PIPESTATUS[0]}; if [ ${RUN} -gt 0 ]; then echo "BAD ending command: $0"; exit -1; fi #job2SOLV1
+$MPICommand $MPISerial $MPIOptionsSerial bash -c 'LastTiMe=$(find ./processor* -maxdepth 1 -mindepth 1 -type d | awk -F/ '\''{print 1*$NF}'\'' | grep -v ''0.org'' | sort -g | tail -1); LastTiMe0=0; for PROC in ./processor*; do if [ -d ${PROC}/${LastTiMe0} ]; then for VAR in $(find ${PROC}/${LastTiMe0} -maxdepth 1 -type f); do VARNAME=$(echo $VAR | awk -F/ '\''{print $NF}'\''); if [ ! -f ${PROC}/${LastTiMe}/${VARNAME} ]; then CMD=$(echo ''if [ -f ${VAR} ]\; then cp ${VAR} ${PROC}/${LastTiMe}\; fi''); eval $CMD; fi; done; fi; done' #job2SOLV1
+$MPICommand -np $NCPUsSolver $MPIOptions sample -parallel -latestTime 2>&1 | tee ./log/060_sample_$simID.log; RUN=${PIPESTATUS[0]}; if [ ${RUN} -gt 0 ]; then echo "BAD ending command: $0"; exit -1; fi #job2SOLV1
+$MPICommand -np $NCPUsSolver $MPIOptions foamToEnsight -parallel -noZero 2>&1 | tee ./log/070_foamToEnsight_$simID.log; RUN=${PIPESTATUS[0]}; if [ ${RUN} -gt 0 ]; then echo "BAD ending command: $0"; exit -1; fi #job2SOLV1
+$MPICommand $MPISerial $MPIOptionsSerial bash -c 'python /apps/ford/aero/fordcfd/v2.4.2/scripts/icon_success_log.py' #job2SOLV1
+"""
+
+    commands_info_str  = "MAP_FROM=" + location + "\n"
+    commands_info_str += commands_info_template
+
+    with open("commands.info","w") as f:
+        f.write(commands_info_str)
+
+
+def findTransientBlowup():
+    """Find the location where the transient solver blew up"""
+    # Figure out the current solver time:
+    # First check the last 200 lines
+    nlines = 200
+    current_solver_time = fordcfd.icon.get_current_solver_time(case_dir=".",n_tail_lines=200)
+    while current_solver_time is None and nlines < 10000:
+        nlines *= 2
+        current_solver_time = fordcfd.icon.get_current_solver_time(case_dir=".",n_tail_lines=nlines)            
+
+    if current_solver_time != fordcfd.icon.get_endtime(case_dir="."):
+        print("Times are: " + str(current_solver_time) + " (final simulation time) and " + str(fordcfd.icon.get_endtime(case_dir=".")) + " (target simulation time).")
+        print("The run blew up in the transient solver at time " + str(current_solver_time) + ".")
+    else:
+        print("The run did not blow up. No need to 'retry' the simulation.")
+        print("To run the simulation for longer, use the 'add-time' flag only.")
+        sys.exit()
+
+
+def findSteadyBlowup():
+    """Find the iteration at which the steady solver blew up"""
+    # Figure out the current solver time
+    # First check the last 200 lines
+    nlines = 200
+    current_solver_time = fordcfd.icon.get_current_solver_time(case_dir=".",n_tail_lines=200)
+    # Load increasingly more lines until the current solver time is found
+    while current_solver_time is None and nlines < 10000:
+        nlines *= 2
+        current_solver_time = fordcfd.icon.get_current_solver_time(case_dir=".",n_tail_lines=nlines)
+
+    if current_solver_time != fordcfd.icon.get_endtime(case_dir="."):
+       print("Iterations are: " + str(current_solver_time) + " (final simulation iteration) and " + str(fordcfd.icon.get_endtime(case_dir=".")) + " (target simulation iteration).")
+       print("The run blew up in the steady solver at time " + str(current_solver_time) + ".")
+    else:
+       print("The run did not blow up.  No need to 'retry' the simulation.")
+       print("To run the simulation for longer, use the 'add-iterations' flag only.")
+       sys.exit()
+
+
+def reduceDt(controlDictPath):
+    """Reduce the timestep to continue the run"""
+    with open(controlDictPath) as f:
+        controlDictNew = ""
+        for line in f.readlines():
+            if re.match("^deltaT (.*);(.*)",line):
+                line_args = (line.strip()).split()
+                oldDt = float(line_args[1][:-1])
+                newDt = round(0.5*oldDt,8)
+                newDt_string = str(newDt) + ";"
+                line = line.replace(line_args[1],newDt_string)
+                print(line_args[0])
+                print("  Old value: " + str(oldDt))
+                print("  New value: " + str(newDt))                
+            controlDictNew += line
+    with open(controlDictPath,"w") as f:
+        f.write(controlDictNew)    
+
+
+def addNonOrthCorr(fvSolutionPath):
+    """Add non-orthogonal correctors to continue the run"""
+    with open(fvSolutionPath) as f:
+        fvSolutionNew = ""
+        inPISO = False
+        for line in f.readlines():
+            # Check for the end of the PISO sub-dict
+            if inPISO and re.match("^}$",line):
+                inPISO = False
+            if inPISO:
+                line_args = (line.strip()).split()
+                if len(line_args) > 1:
+                    if line_args[0] == "nNonOrthogonalCorrectors":
+                        oldNOC = int(line_args[1][:-1])
+                        newNOC = oldNOC+1
+                        newNOC_string = str(newNOC) + ";"
+                        line = line.replace(line_args[1],newNOC_string)
+                        print(line_args[0])
+                        print("  Old nNonOrthogonalCorrectors: " + str(oldNOC))
+                        print("  New nNonOrthogonalCorrectors: " + str(newNOC))
+            # Check for the start of the PISO sub-dict
+            if re.match("^PISO$",line):
+                inPISO = True
+            fvSolutionNew += line
+    with open(fvSolutionPath,"w") as f:
+        f.write(fvSolutionNew)
+
+
+def resubmitJob(version):
+    """Resubmit the job"""
+    N = fordcfd.icon.get_number_of_cpus()
+    subprocess.call('runiconcfd -N ' + str(N) + ' -V ' + version + ' -c commands.info -P ' + args.vehicle_program, shell=True)
+
+    
+# Determine if we're running a steady-state simulation
+isSteady = fordcfd.icon.steady_case()
+if isSteady:
+    print("Steady-state simulation detected.")
+else:
+    print("Transient simulation detected.")
+
+# Check the input arguments to make sure they are appropriate
+checkInputArguments()
+
+# Determine the version of iconCFD that the job was originally run with
+iconcfdVersion = getIconcfdVersion()
+
+# Actions to take for a steady run
+if isSteady:
+    # This hasn't been run at all, we're just seeding from another run
+    if args.add_iterations is None and args.retry is None and args.seed_case_location is not None:
+        modifyCommandsInfoMappedCaseFromScratchSteady(args.seed_case_location)
+    # We just want to add time, aren't fixing a failed run
+    elif args.add_iterations is not None and args.retry is None:
+        addIterations(args.add_iterations)
+        modifyCommandsInfoSteady()
+    # We're fixing a failed run
+    elif args.add_iterations is None and args.retry is not None:
+        # Make sure we actually need to retry this one
+        findSteadyBlowup()
+        if "lower-URFs" in args.retry:
+            # Reduce the URFs
+            reduceURFs()
+        # Make sure we start from the field at iteration 0, not the field that was written
+        # when the simulation blew up
+        startFromTimeZero(os.path.join(os.getcwd(),"system","controlDict"))
+
+        if "seed-case" in args.retry:
+            modifyCommandsInfoMappedCaseSteady(args.seed_case_location)
+        else:
+            modifyCommandsInfoSteady()
+    # We're fixing a failed run and running a steady simulation for longer
+    elif args.add_iterations is None and args.retry is not None:
+        # Make sure we actually need to retry this one
+        findSteadyBlowup()
+        if "lower-URFs" in args.retry:
+            # Reduce the URFs
+            reduceURFs()
+
+        # Make sure we start from the field at iteration 0, not the field that was written
+        # when the simulation blew up
+        startFromTimeZero(os.path.join(os.getcwd(),"system","controlDict"))
+
+        # Add iterations
+        if "lower-URFs" in args.retry:
+            addIterations(args.add_iterations,increaseAveragingStartTime=True,retry=True)
+        else:
+            addIterations(args.add_iterations,retry=True)
+
+        if "seed-case" in args.retry:
+            modifyCommandsInfoMappedCaseSteady(args.seed_case_location)
+        else:
+            modifyCommandsInfoSteady()
+
+
+# Actions to take for a transient run
+else:
+    # This hasn't been run at all, we're just seeding from another run
+    if args.add_time is None and args.retry is None and args.seed_case_location is not None:
+        modifyCommandsInfoMappedCaseFromScratchTransient(args.seed_case_location)
+    # We just want to add time, aren't fixing a failed run
+    elif args.add_time is not None and args.retry is None:
+        addTime(args.add_time,os.path.join(os.getcwd(),"system","controlDict"))
+        modifyCommandsInfoTransient()
+    # We're fixing a failed run
+    elif args.add_time is None and args.retry is not None:
+        # First, figure out where we blew up
+        findTransientBlowup()
+        if "smaller-dt" in args.retry:
+            reduceDt(os.path.join(os.getcwd(),"system","controlDict"))
+        if "more-nonOrthogonal-correctors" in args.retry:
+            addNonOrthCorr(os.path.join(os.getcwd(),"system","fvSolution"))
+        # Make sure we start from the field at time 0, not the field that was written
+        # when the simulation blew up            
+        startFromTimeZero(os.path.join(os.getcwd(),"system","controlDict"))            
+        if "seed-case" in args.retry:
+            modifyCommandsInfoMappedCaseTransient(args.seed_case_location)
+        else:
+            modifyCommandsInfoTransient()
+    # We're fixing a failed run and running the transient solver for longer
+    elif args.add_time is not None and args.retry is not None:
+        # First, figure out where we blew up
+        findTransientBlowup()
+        # Reduce the timestep or add NOCs here
+        if "smaller-dt" in args.retry:
+            reduceDt(os.path.join(os.getcwd(),"system","controlDict"))
+        if "more-nonOrthogonal-correctors" in args.retry:
+            addNonOrthCorr(os.path.join(os.getcwd(),"system","fvSolution"))
+
+        # Make sure we start from the field at time 0, not the field that was written
+        # when the simulation blew up
+        startFromTimeZero(os.path.join(os.getcwd(),"system","controlDict"))
+
+        # Add time to the transient solver
+        addTime(args.add_time,os.path.join(os.getcwd(),"system","controlDict"),retry=True)
+
+        if "seed-case" in args.retry:
+            modifyCommandsInfoMappedCaseTransient(args.seed_case_location)
+        else:
+            modifyCommandsInfoTransient()
+    
+# Resubmit the job    
+resubmitJob(iconcfdVersion)
