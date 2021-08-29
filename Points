@@ -1,0 +1,158 @@
+#!/bin/python
+
+xmax = 2.115		# max length of the car
+ymax = 0.912		# max y width without mirrors
+zmax = 1.431		# max height 
+wcrearz = 0.313 	# z value of the rear wheelbase center / SLR 
+cPillary = 0.624	# y position of the c-pillar/flaps
+cPillarz = 1.150	# z position of the c-pillar/flaps
+wakeClosure = 2.88	# closing point of the wake in X direction
+floor = 0      	    # z position of the floor   
+#--------------------------------------------------------------
+print("Using values for car size...\n   xmax: {}\n   ymax: {}\n   zmax: {}\nas reference points...\n   wcrearz: {}\n   cPillary: {}\n   cPillarz: {}\nfor the wake and floor...\n   wakeClosure: {}\n   floor: {}".format(xmax, ymax, zmax,wcrearz,cPillary,cPillarz,wakeClosure,floor))
+#--------------------------------------------------------------
+# plane positions
+x1 = float(xmax + ((wakeClosure - xmax)/2)) # between wake closure point and rear end
+x2 = float(wakeClosure)                     # wake closure point
+x3 = float(wakeClosure + 1.00)              # 1 m offset behind wake closure point
+y0 = 0                                      # symmetry plane
+y1 = float(cPillary)                        # c pillar
+z1 = float(wcrearz)                         # wheel center rear 
+z2 = float(zmax/2)                          # car height / 2
+z3 = float(cPillarz)                        # c pillar
+#--------------------------------------------------------------
+# space between points and offsets
+di = 0.02       # homogen increment between points
+offsetX = 2.5   # plane length in for y and z planes
+offsetY = 0.2   # +-0.2 m to the sides of the car (without mirrors!)
+offsetZ = 0.4   # +0.4 m higher than the car height 
+#--------------------------------------------------------------
+x = x1                # fixed value  
+z = float(floor)      # Start value
+data = []
+while z <= float(round(zmax,1)+offsetZ+di):
+    y = int(round(-ymax))-offsetY
+
+    while y <= float(int(round(ymax))+offsetY+di):
+        data.append([x,y,z])
+	y = y + di
+    
+    z = z + di
+
+with open("plane_x1.txt", "w") as g: 
+    for line in data:
+        g.write("({:.2f} {:.2f} {:.2f})\n".format(line[0],line[1],line[2]))
+
+x = x2                # fixed value
+z = float(floor)      # Start value
+data = []
+while z <= float(round(zmax,1)+offsetZ+di):
+    y = int(round(-ymax))-offsetY
+
+    while y <= float(int(round(ymax))+offsetY+di):
+        data.append([x,y,z])
+        y = y + di
+
+    z = z + di
+
+with open("plane_x2.txt", "w") as g:
+    for line in data:
+        g.write("({:.2f} {:.2f} {:.2f})\n".format(line[0],line[1],line[2]))
+
+x = x3                # fixed value
+z = float(floor)      # Start value
+data = []
+while z <= float(round(zmax,1)+offsetZ+di):
+    y = int(round(-ymax))-offsetY
+
+    while y <= float(int(round(ymax))+offsetY+di):
+        data.append([x,y,z])
+        y = y + di
+
+    z = z + di
+
+with open("plane_x3.txt", "w") as g:
+    for line in data:
+        g.write("({:.2f} {:.2f} {:.2f})\n".format(line[0],line[1],line[2]))
+
+#---------------------------------------------------------------------------
+y = y0           # fixed value
+z = float(floor) # Start value
+data = []
+while z <= float(round(zmax,1)+offsetZ+di):
+    x = float(x3-offsetX)
+
+    while x <= float(x3+di):
+        data.append([x,y,z])
+        x = x + di
+
+    z = z + di
+
+with open("plane_y0.txt", "w") as g:
+    for line in data:
+        g.write("({:.2f} {:.2f} {:.2f})\n".format(line[0],line[1],line[2]))
+
+y = y1           # Start value
+z = float(floor) # Start value
+data = []
+while z <= float(round(zmax,1)+offsetZ+di):    
+    x = float(x3-offsetX)
+
+    while x <= float(x3+di):
+        data.append([x,y,z])
+        x = x + di
+
+    z = z + di
+
+with open("plane_y1.txt", "w") as g:
+    for line in data:
+        g.write("({:.2f} {:.2f} {:.2f})\n".format(line[0],line[1],line[2]))
+
+#----------------------------------------------------------------------------
+y = int(round(-ymax))-offsetY
+z = z1 # Start value
+data = []
+while y <= float(int(round(ymax))+offsetY+di):
+    x = float(x3-offsetX)
+
+    while x <= float(x3+di):
+        data.append([x,y,z])
+        x = x + di
+
+    y = y + di
+
+with open("plane_z1.txt", "w") as g:
+    for line in data:
+        g.write("({:.2f} {:.2f} {:.2f})\n".format(line[0],line[1],line[2]))
+
+y = int(round(-ymax))-offsetY
+z = z2 # Start value
+data = []
+while y <= float(int(round(ymax))+offsetY+di):
+    x = float(x3-offsetX)
+
+    while x <= float(x3+di):
+        data.append([x,y,z])
+        x = x + di
+
+    y = y + di
+
+with open("plane_z2.txt", "w") as g:
+    for line in data:
+        g.write("({:.2f} {:.2f} {:.2f})\n".format(line[0],line[1],line[2]))
+
+y = int(round(-ymax))-offsetY
+z = z3 # Start value
+data = []
+while y <= float(int(round(ymax))+offsetY+di):
+    x = float(x3-offsetX)
+
+    while x <= float(x3+di):
+        data.append([x,y,z])
+        x = x + di
+
+    y = y + di
+
+with open("plane_z3.txt", "w") as g:
+    for line in data:
+        g.write("({:.2f} {:.2f} {:.2f})\n".format(line[0],line[1],line[2]))
